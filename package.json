@@ -1,11 +1,17 @@
 {
 	"name": "pi-refine-compact",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Replace pi's stock /compact summarization with chunked refine summarization by a cheaper model of your choice",
 	"license": "MIT",
 	"author": "Dmitrii Glashkov",
 	"type": "module",
-	"keywords": ["pi-package", "pi", "compaction", "summarization", "context-window"],
+	"keywords": [
+		"pi-package",
+		"pi",
+		"compaction",
+		"summarization",
+		"context-window"
+	],
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/Glashkoff/pi-refine-compact.git"
@@ -22,6 +28,8 @@
 		"@earendil-works/pi-agent-core": "*"
 	},
 	"pi": {
-		"extensions": ["extensions"]
+		"extensions": [
+			"extensions"
+		]
 	}
 }
