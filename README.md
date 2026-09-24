@@ -16,11 +16,14 @@ Instead of one giant summarization call on the session model, the history is cut
 ## Install
 
 ```sh
-pi install git:github.com/Glashkoff/pi-refine-compact
-# pinned:
-pi install git:github.com/Glashkoff/pi-refine-compact@v0.1.0
+pi install npm:pi-refine-compact
 ```
 
+Alternative — install straight from the git source:
+
+```sh
+pi install git:github.com/Glashkoff/pi-refine-compact
+```
 ## Use
 
 1. Run `/compact-model` in pi and pick the summarization model (the menu is the same style as `/model`, with context sizes shown).
