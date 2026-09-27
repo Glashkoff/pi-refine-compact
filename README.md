@@ -2,16 +2,9 @@
 
 A [pi](https://github.com/earendil-works/pi) package that replaces the stock summarization (`/compact` and auto-compaction) with **chunked refine summarization** performed by a cheaper model of your choice.
 
-Instead of one giant summarization call on the session model, the history is cut into chunks at turn boundaries and merged sequentially into a structured checkpoint (Refine, [arXiv 2308.15022](https://arxiv.org/abs/2308.15022)) — so a small local or cheap cloud model can do the job the main model no longer needs to pay for.
+Instead of one giant summarization call on the session model, the history is cut into chunks at turn boundaries and merged sequentially into a structured checkpoint using the *refine* summarizer ([arXiv 2308.15022](https://arxiv.org/abs/2308.15022)) — so the expensive summarization moves off the main model, and a small local model or a cheap cloud model can do the job.
 
-## How it works
-
-- **Chunking** — the compacted prefix is cut into at least `ceil(main_ctx / summarizer_ctx)` chunks, only at turn boundaries (a tool result is never separated from its tool call), with a safety budget per chunk.
-- **Merging** — each chunk updates a growing summary in a strict format (Goal / Constraints / Progress / Key Decisions / Next Steps / Critical Context), following the recursive summarization method of [arXiv:2308.15022v4](https://arxiv.org/abs/2308.15022) (Wang et al., *Recursively Summarizing Enables Long-Term Dialogue Memory in Large Language Models*, Neurocomputing 2025): the first chunk is memorized on its own, every following chunk updates the previous memory with its context, exactly the paper's `update_memory` recursion.
-- **Resilience** — a chunk that hits the summarizer's output limit is re-split at turn boundaries (the length-stop path retries up to 2 levels of splits; a separate preemptive splitter cuts chunks whose serialized prompt exceeds `maxPromptTokens` before calling the model); transient errors retry once; computed chunks are cached in memory, so a retry never redoes finished work. If the intermediate checkpoint compression fails, compaction continues with the uncompressed summary (degraded mode) instead of aborting.
-- **Summary ceiling** — when the accumulated summary outgrows its ceiling, the checkpoint itself is compressed by an intermediate call, so chunk + summary always fit into the summarizer's window.
-- **English summaries** — regardless of the conversation language (small models are measurably better with EN; code identifiers and paths stay verbatim).
-- **Freshness marker** — the final summary is stamped with the checkpoint time and the read/modified file lists, like pi's stock compaction.
+**Note:** This extension does not affect the summarization used by `/tree`. Branch summarization solves a different problem and calls for a different approach.
 
 ## Install
 
@@ -24,12 +17,19 @@ Alternative — install straight from the git source:
 ```sh
 pi install git:github.com/Glashkoff/pi-refine-compact
 ```
+
 ## Use
 
 1. Run `/compact-model` in pi and pick the summarization model (the menu is the same style as `/model`, with context sizes shown).
-2. Work until compaction triggers (manually via `/compact`, or automatically at the context threshold).
+2. Work until it's time to compact — manually via `/compact`, or automatically at the context threshold.
 
 That's it. Without a selected model — or when the extension is disabled — pi's stock behavior is used.
+
+## Notes
+
+- The model's own context window, when known, drives chunking; unknown windows fall back to 32k.
+- If the selected model disappears from the registry, a warning is shown and stock compaction proceeds for that session.
+- Extensions run with full system access — review the source before installing (it's one file: `extensions/pi-refine-compact.ts`; the only network calls it makes are the summarizer LLM requests you configure).
 
 ## Settings
 
@@ -67,11 +67,37 @@ Chunk sizes are estimated from character counts. The default `3` is tuned for Cy
 }
 ```
 
-## Notes
+## Details
 
-- The model's own context window, when known, drives chunking; unknown windows fall back to 32k.
-- If the selected model disappears from the registry, a warning is shown and stock compaction proceeds for that session.
-- Extensions run with full system access — review the source before installing (it's one file: `extensions/pi-refine-compact.ts`; the only network calls it makes are the summarizer LLM requests you configure).
+### How it works
+
+**Chunked refine** — the compacted prefix is cut into chunks at turn boundaries and merged sequentially by a cheaper summarizer into a structured checkpoint.
+**Cheap and long** — the compression runs on a small local or cloud model, so the main model doesn't pay for it and long histories fit on a modest context window.
+**Resilient** — chunks re-split on output limits, computed chunks are cached, and a failing intermediate compression degrades instead of aborting.
+
+See [DESIGN.md](docs/DESIGN.md) for the full algorithm — budget derivation, chunking, the refine loop, resilience, and the char-based sizing rationale.
+
+### Trade-offs and limitations
+
+This approach trades off latency, precision, and token efficiency for cheaper main-model usage and long-history compression on small/cheap summarizers. It works best when the summarizer is significantly less expensive than the main model.
+
+**Strengths:**
+
+- **Cheaper main-model usage** — the compression step runs on the chosen summarizer (often a small, cheap or local model) instead of the main model, so you don't burn expensive context on a pure housekeeping task.
+- **Very long histories on a small window** — chunking plus the recursive
+- **Structured, downstream-friendly checkpoint** — the fixed format is easy for another LLM to consume and preserves file paths, commands, and decisions verbatim.
+- **Resilient by design** — preemptive and length-cap splits, one transient retry, in-memory reuse of computed chunks, and degraded mode for checkpoint compression mean compaction almost never aborts outright.
+- **Multi-stage aware** — it seeds from `previousSummary`, so repeated compactions build on the prior checkpoint instead of starting over.
+
+**Weaknesses:**
+
+- **Many calls, more latency** — one summarize call per chunk (plus splits and occasional checkpoint compression) instead of a single stock compaction call. On a cheap model the per-token cost is lower, but wall-clock latency and the number of round-trips are higher.
+- **Redundant re-processing** — the accumulated summary is re-sent with every chunk, so the summarizer reprocesses the same content repeatedly. That extra token cost is the price of fitting a large history into a small window.
+- **Cumulative information loss** — each refine step compresses already-compressed memory (lossy compression of lossy data). Over many chunks and repeated compactions the checkpoint slowly drifts; fine-grained details are lost first (the recursive method's well-known weakness, not a bug in this implementation).
+- **Bounded by the summarizer's quality** — the checkpoint is only as good as the summarizer running it; a weak summarizer yields a weak checkpoint regardless of how good the main model is.
+- **Imprecise size estimation** — the char-based `charsPerToken` estimate (`approxTokensOfChars = ceil(chars / charsPerToken)`) can be off, causing occasional over- or under-sizing of chunks; the splitters handle this at extra cost (see `charsPerToken`).
+- **Interdependent budget constants** — the whole budget chain is tuned as a unit (see DESIGN.md); tuning one knob in isolation tends to break it.
+- **Additional model dependency** — the extension needs a second model configured; if it is slow, unavailable, or misconfigured, compaction degrades or falls back to stock (which loses the benefit).
 
 ## Compatibility
 
