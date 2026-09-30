@@ -129,4 +129,5 @@ The configurable settings are all derived in [Budget derivation](#1-budget-deriv
 
 - **Stock fallback** — if no summarizer is selected (`model: null`) or a configured model is missing from `ctx.modelRegistry`, the extension defers to stock pi compaction. See [Stage 0](#0-preconditions).
 - **Observability** — every stage reports via `ctx.ui.notify`, and the chunk-level progress ledger is written as durable custom entries (`pi.appendEntry` with a registered entry renderer): visible in the transcript, guaranteed not to enter the model context. The ledger shows model + plan up front, one line per chunk (index/percent), split levels, and a final run summary (chunks/splits/shrinks/elapsed).
+- **Model picker** — `/compact-model` reuses pi's own selector recipe (`Input` + `SelectList` + `fuzzyFilter` from `@earendil-works/pi-tui`), shown via `ctx.ui.custom()` in interactive TUI mode with a plain `ui.select` fallback elsewhere: compact, fuzzy-filtered, never overflows the screen.
 - **Post-mortem** — the returned `CompactionEntry` records `details.budgets`, `chunks`, `retrySplits`, `shrinkCount`, and `cacheHits`. See [Stage 6](#6-output-assembly).

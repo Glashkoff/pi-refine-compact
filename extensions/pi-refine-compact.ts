@@ -45,7 +45,7 @@
 
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { uuidv7 } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, fuzzyFilter, getKeybindings, Input, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -157,6 +157,94 @@ function parseModelRef(ref: string): { provider: string; id: string } | undefine
 }
 
 // ============================================================================
+// Compact filtered model picker ( mirrors pi's built-in /model selector UI:
+// Input + SelectList + fuzzyFilter — all public @earendil-works/pi-tui APIs,
+// shown via the documented ctx.ui.custom() interception point )
+// ============================================================================
+
+/** The subset of pi's Theme our picker needs. */
+interface PickerTheme {
+	fg(color: string, text: string): string;
+}
+
+/** Fuzzy-filtered compact list, mirrors pi's ThinkingSelectorComponent. */
+class ModelPicker extends Container {
+	private allItems: SelectItem[];
+	private searchInput: Input;
+	private selectList: SelectList;
+	private selectListChildIndex: number;
+	private theme: PickerTheme;
+	private commit: (value: string | undefined) => void;
+	private _focused = false;
+
+	get focused(): boolean {
+		return this._focused;
+	}
+	set focused(value: boolean) {
+		this._focused = value;
+		this.searchInput.focused = value;
+	}
+
+	constructor(allItems: SelectItem[], theme: PickerTheme, commit: (value: string | undefined) => void) {
+		super();
+		this.allItems = allItems;
+		this.theme = theme;
+		this.commit = commit;
+		this.addChild(new Text("Model for compaction summarization", 0, 0));
+		this.addChild(new Spacer(1));
+		this.searchInput = new Input({ placeholder: "type to filter" });
+		this.searchInput.onSubmit = () => this.selectList.handleInput("\r");
+		this.addChild(this.searchInput);
+		this.addChild(new Spacer(1));
+		this.selectList = this.buildList(this.allItems);
+		this.selectListChildIndex = this.children.length;
+		this.addChild(this.selectList);
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("dim", "  ↑/↓ select · Enter confirm · Esc cancel"), 0, 0));
+	}
+
+	private buildList(items: SelectItem[]): SelectList {
+		const list = new SelectList(items, Math.max(1, Math.min(items.length, 12)), {
+			selectedPrefix: (t) => this.theme.fg("accent", t),
+			selectedText: (t) => this.theme.fg("accent", t),
+			description: (t) => this.theme.fg("muted", t),
+			scrollInfo: (t) => this.theme.fg("muted", t),
+			noMatch: (t) => this.theme.fg("muted", t),
+		});
+		list.onSelect = (item) => this.commit(item.value);
+		list.onCancel = () => this.commit(undefined);
+		return list;
+	}
+
+	private applyFilter(query: string): void {
+		const filtered = query
+			? fuzzyFilter(this.allItems, query, (item) => `${item.value} ${item.label}`)
+			: this.allItems;
+		const selected = this.selectList.getSelectedItem();
+		const preserved = filtered.find((item) => item.value === selected?.value)?.value;
+		const newList = this.buildList(filtered);
+		if (preserved !== undefined) {
+			const idx = filtered.findIndex((item) => item.value === preserved);
+			if (idx !== -1) newList.setSelectedIndex(idx);
+		}
+		this.children[this.selectListChildIndex] = newList;
+		this.selectList = newList;
+	}
+
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+		const isNav = kb.matches(keyData, "tui.select.up") ||
+			kb.matches(keyData, "tui.select.down") ||
+			kb.matches(keyData, "tui.select.confirm") ||
+			kb.matches(keyData, "tui.select.cancel");
+		if (isNav) {
+			this.selectList.handleInput(keyData);
+			return;
+		}
+		this.searchInput.handleInput(keyData);
+		this.applyFilter(this.searchInput.getValue());
+	}
+}
 // Retry infrastructure: in-memory chunk cache (C4), hash, length-cap error (C1)
 // ============================================================================
 
@@ -221,11 +309,30 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				items.push(`${ref}   [${ctxK}]${marker}`);
 				refs.push(ref);
 			}
-			const sel = await ctx.ui.select("Model for compaction summarization", items, {});
-			if (sel === undefined) return; // cancelled
-			const chosen = refs[items.indexOf(sel)];
-			if (chosen === undefined) return;
-			writeSettings({ ...current, model: chosen });
+			// Compact picker (filtered, like pi's own /model menu); fall back to
+			// the plain select dialog outside interactive TUI mode.
+			let chosen: string | null | undefined;
+			if (ctx.mode === "tui") {
+				const DEFAULT_REF_MARKER = "__default__";
+				const selectItems: SelectItem[] = items.map((label, i) => ({
+					value: refs[i] === null ? DEFAULT_REF_MARKER : (refs[i] as string),
+					label,
+				}));
+				chosen = await ctx.ui.custom<string | null | undefined>(
+					(_tui, theme, _keybindings, done) =>
+						new ModelPicker(selectItems, theme as unknown as PickerTheme, (value) =>
+							done(value === DEFAULT_REF_MARKER ? null : value),
+						),
+				);
+			} else {
+				const sel = await ctx.ui.select("Model for compaction summarization", items, {});
+				if (sel === undefined) return; // cancelled
+				const idx = items.indexOf(sel);
+				if (idx === -1) return;
+				chosen = refs[idx];
+			}
+			if (chosen === undefined) return; // cancelled
+			writeSettings({ ...current, model: chosen ?? null });
 			ctx.ui.notify(
 				chosen
 					? `Summarization will be performed by ${chosen}`
