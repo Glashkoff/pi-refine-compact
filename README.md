@@ -76,6 +76,7 @@ Chunk sizes are estimated from character counts. The default `3` is tuned for Cy
 **Resilient** — chunks re-split on output limits, computed chunks are cached, and a failing intermediate compression degrades instead of aborting.
 
 See [DESIGN.md](docs/DESIGN.md) for the full algorithm — budget derivation, chunking, the refine loop, resilience, and the char-based sizing rationale.
+See [CHANGELOG.md](CHANGELOG.md) for notable changes per version.
 
 ### Trade-offs and limitations
 

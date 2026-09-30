@@ -25,6 +25,7 @@
   "files": [
     "extensions",
     "docs/DESIGN.md",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],
