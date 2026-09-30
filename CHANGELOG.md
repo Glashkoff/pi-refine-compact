@@ -2,7 +2,7 @@
 
 Notable changes per version (Keep a Changelog format, SemVer).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-01
 
 ### Fixed
 
