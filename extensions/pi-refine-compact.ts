@@ -45,6 +45,7 @@
 
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { uuidv7 } from "@earendil-works/pi-ai";
+import { Text } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -190,11 +191,21 @@ class LengthCapError extends Error {
 /** A deterministic provider limit — retrying only burns attempts (pi's
  * NON_RETRYABLE provider-limit family: quota/billing/usage limits). */
 const NON_RETRYABLE_ERROR_PATTERN = /quota|insufficient|out of budget|usage limit|billing|subscription/i;
+
+/** Custom-entry type for the compaction progress log (durable, not sent to LLM). */
+const PROGRESS_ENTRY_TYPE = "refine-compact-progress";
 // ============================================================================
 // /compact-model command — choose the summarization model
 // ============================================================================
 
 export default function piRefineCompactExtension(pi: ExtensionAPI) {
+	// Live progress lines rendered in the transcript. Entries are stored in the
+	// session via pi.appendEntry() and are NOT part of the model context —
+	// the documented way to emit durable, non-LLM-visible output.
+	pi.registerEntryRenderer<{ message: string }>(PROGRESS_ENTRY_TYPE, (entry, _opts, theme) =>
+		new Text(theme.fg("accent", `▸ refine-compact · ${entry.data?.message ?? ""}`), 0, 0),
+	);
+
 	pi.registerCommand("compact-model", {
 		description: "Choose the model used for compaction (/compact summarization)",
 		handler: async (_args, ctx) => {
@@ -315,10 +326,26 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		// directly respects the prompt cap without preemptive splits.
 		const chunks = chunkByTurns(allMessages, ratio, sumCtx, safetyBudget, previousSummary, charsPerToken, maxPromptTokens);
 		const totalChars = chunks.reduce((acc, c) => acc + approxChars(c), 0);
-		ctx.ui.notify(
-			`pi-refine-compact: ${chunks.length} chunk(s), ~${Math.round(totalChars / charsPerToken / 1000)}k tok., model ${settings.model}`,
-			"info",
-		);
+		// Progress ledger for the transcript (durable session entries, not the
+		// model context): model + plan first, then one line per milestone.
+		const chunkSizes = chunks.map((c) => approxChars(c));
+		const totalSize = chunkSizes.reduce((a, b) => a + b, 0);
+		let currentChunk = 0;
+		const startedAt = Date.now();
+		const progress = (message: string): void => {
+			try {
+				pi.appendEntry(PROGRESS_ENTRY_TYPE, { message });
+			} catch {
+				// Session mid-mutation or exotic mode — degrade to a notification.
+				ctx.ui.notify(`pi-refine-compact: ${message}`, "info");
+			}
+		};
+		const progressStatus = (): string => {
+			// Completed chunks only — the in-flight chunk must not inflate the %.
+			const done = chunkSizes.slice(0, currentChunk - 1).reduce((a, b) => a + b, 0);
+			const pct = totalSize > 0 ? Math.round((done / totalSize) * 100) : 0;
+			return `chunk ${currentChunk}/${chunks.length} (~${pct}%)`;
+		};
 
 		let acc = previousSummary ?? "";
 		const usageParts: UsageLike[] = [];
@@ -398,7 +425,9 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				if (attempt < DEFAULTS.retryAttempts) {
 					const delayMs = Math.min(DEFAULTS.retryMaxDelayMs, DEFAULTS.retryBaseDelayMs * 2 ** (attempt - 1));
 					ctx.ui.notify(`pi-refine-compact: ${label} failed (${lastErr}) — retry ${attempt + 1}/${DEFAULTS.retryAttempts} in ${delayMs / 1000}s`, "warning");
-		await sleepMs(delayMs);
+					progress(`${progressStatus()} (${settings.model}) — retrying in ${delayMs / 1000}s: ${lastErr}`);
+					await sleepMs(delayMs);
+					progress(`${progressStatus()} — retrying ${attempt + 1} / ${DEFAULTS.retryAttempts}`);
 					if (signal?.aborted) throw new Error("Compaction cancelled");
 				}
 			}
@@ -429,6 +458,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				if (halves) {
 					retrySplits++;
 					ctx.ui.notify(`pi-refine-compact: prompt > ${maxPromptTokens} tok. — preemptive split (level ${depth + 1})`, "info");
+					progress(`${progressStatus()} — prompt > ${maxPromptTokens} tok., preemptive split (level ${depth + 1})`);
 					let local = accText;
 					for (const half of halves) local = await refineChunk(half, local, depth + 1);
 					cacheSet(key, local);
@@ -459,6 +489,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 						if (halves) {
 							retrySplits++;
 							ctx.ui.notify(`pi-refine-compact: chunk hit the length cap — split at turn boundaries (level ${depth + 1})`, "info");
+							progress(`${progressStatus()} — reply hit maxTokens, length-cap split (level ${depth + 1})`);
 							let local = accText;
 							for (const half of halves) local = await refineChunk(half, local, depth + 1);
 							cacheSet(key, local);
@@ -525,11 +556,21 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		for (const chunk of chunks) {
+		// Model + plan up front, one durable line per chunk, and a run summary —
+		// all in the transcript (appendEntry), never in the LLM context.
+		progress(`summarizing with ${settings.model} · ${chunks.length} chunk(s) · ~${Math.round(totalChars / charsPerToken / 1000)}k tok.`);
+		for (let i = 0; i < chunks.length; i++) {
 			if (signal?.aborted) throw new Error("Compaction cancelled");
+			currentChunk = i + 1;
+			progress(progressStatus());
 			acc = await compressAccIfNeeded(acc);
-			acc = await refineChunk(chunk, acc, 0);
+			acc = await refineChunk(chunks[i], acc, 0);
+			progress(progressStatus() + " — chunk done");
 		}
+		progress(
+			`completed · chunks: ${chunks.length} · splits: ${retrySplits} · shrinks: ${shrinkCount} · ` +
+			`${Math.round((Date.now() - startedAt) / 1000)}s`,
+		);
 
 		if (!acc) throw new Error("pi-refine-compact: no summary produced");
 
