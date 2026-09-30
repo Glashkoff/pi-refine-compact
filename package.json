@@ -5,6 +5,9 @@
     "license": "MIT",
     "author": "Dmitrii Glashkov",
     "type": "module",
+    "scripts": {
+        "test": "bun test"
+    },
     "keywords": [
         "pi-package",
         "pi",

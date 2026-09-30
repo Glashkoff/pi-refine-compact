@@ -29,7 +29,7 @@ Every compaction run goes through the following stages.
 
 ### 0. Preconditions
 
-The extension hooks pi's `session_before_compact`. As soon as it fires, it reads the settings file and — if no summarizer model is configured — returns immediately, so stock compaction runs byte-for-byte. If a model *is* configured but has vanished from `ctx.modelRegistry`, a warning is shown and stock compaction is used for the session (never a silent switch). Once a model is resolved, `allMessages = messagesToSummarize + turnPrefixMessages` is the full body to compress.
+The extension hooks pi's `session_before_compact`. As soon as it fires, it reads the settings file and — if no summarizer model is configured (`model: null`) — returns immediately, so stock compaction runs byte-for-byte. With `model: "session"` the summarizer is `ctx.model` captured once at that moment: the active model may change while the compaction runs, but the run stays on the captured one. A virtual (router-only, `api: "pi-virtual"`) session model cannot complete a request and the extension does no virtual routing, so it warns and defers to stock. For an explicit `provider/id` that has vanished from `ctx.modelRegistry` the same applies — a warning is shown and stock compaction is used for the session (never a silent switch). Once a model is resolved, `allMessages = messagesToSummarize + turnPrefixMessages` is the full body to compress.
 
 ### 1. Budget derivation
 
@@ -72,7 +72,7 @@ for chunk in chunks:
     acc = refineChunk(chunk, acc, depth=0)
 ```
 
-`refineChunk` builds the prompt `<conversation> … </conversation>` plus, when there is a running summary, `<previous-summary> … </previous-summary>`, then appends `INITIAL_PROMPT` (first chunk) or `UPDATE_PROMPT` (rest). It calls the summarizer once (`callSummarizer`) and caches the result in an in-memory FNV-1a-keyed map (≤ 400 entries), so a retry reuses already-computed work instead of re-calling the GPU.
+`refineChunk` builds the prompt `<conversation> … </conversation>` plus, when there is a running summary, `<previous-summary> … </previous-summary>`, then appends `INITIAL_PROMPT` (first chunk) or `UPDATE_PROMPT` (rest). It calls the summarizer once (`callSummarizer`) and caches the result in an in-memory map (≤ 400 entries) keyed by the run's scope — session id, resolved `provider/id`, and the derived budgets — plus the FNV-1a hashes of the conversation, the running summary and the custom instructions. The scope keeps a cache entry reusable only for the same session, model and budgets, so a retry reuses already-computed work instead of re-calling the GPU while a different scope recomputes.
 
 `callSummarizer` issues exactly one request with the shared `SYSTEM_PROMPT` (which forces the English, verbatim-paths format) and one retry on transient failure: `stop: "error"` (e.g. an empty reply) retries once; `stop: "length"` means the reply hit `maxTokens` and is turned into a `LengthCapError` to trigger a re-split; `stop: "aborted"` cancels the whole compaction.
 
@@ -122,6 +122,6 @@ The configurable settings are all derived in [Budget derivation](#1-budget-deriv
 
 ## Behavior contracts
 
-- **Stock fallback** — if no summarizer is selected (`model: null`) or a configured model is missing from `ctx.modelRegistry`, the extension defers to stock pi compaction. See [Stage 0](#0-preconditions).
+- **Stock fallback** — if no summarizer is selected (`model: null`), the session model is unset or virtual in `session` mode, or a configured model is missing from `ctx.modelRegistry`, the extension defers to stock pi compaction. See [Stage 0](#0-preconditions).
 - **Observability** — every stage reports what it does via `ctx.ui.notify` (chunk count, splits, ceiling compressions), so compaction never looks like a hang.
-- **Post-mortem** — the returned `CompactionEntry` records `details.budgets`, `chunks`, `retrySplits`, and `cacheHits`. See [Stage 6](#6-output-assembly).
+- **Post-mortem** — the returned `CompactionEntry` records `details.refineCompactModel` (the resolved `provider/id`, never the `session` marker), `details.budgets`, `chunks`, `retrySplits`, and `cacheHits`. See [Stage 6](#6-output-assembly).

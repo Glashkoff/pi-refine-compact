@@ -20,15 +20,16 @@ pi install git:github.com/Glashkoff/pi-refine-compact
 
 ## Use
 
-1. Run `/compact-model` in pi and pick the summarization model (the menu is the same style as `/model`, with context sizes shown).
+1. Run `/compact-model` in pi and pick the summarization model (the menu is the same style as `/model`, with context sizes shown). It offers `(default) native: pi's stock compaction`, `session model (refinement): <current model>`, and every available `provider/id`.
 2. Work until it's time to compact — manually via `/compact`, or automatically at the context threshold.
 
-That's it. Without a selected model — or when the extension is disabled — pi's stock behavior is used.
+That's it. The native entry (the default) and a disabled extension leave pi's stock behavior untouched; `session` runs the refine pipeline on whatever model the session is using at compaction time.
 
 ## Notes
 
 - The model's own context window, when known, drives chunking; unknown windows fall back to 32k.
-- If the selected model disappears from the registry, a warning is shown and stock compaction proceeds for that session.
+- If the selected model disappears from the registry, a warning is shown and stock compaction proceeds for that session. `session` mode degrades the same way when the session has no model, and also when it is a virtual (router-only) entry, which cannot complete a request — the extension does no virtual routing.
+- Cached chunks are keyed by the session, the resolved summarizer, and the derived budgets, so switching any of them recomputes instead of reusing stale text.
 - Extensions run with full system access — review the source before installing (it's one file: `extensions/pi-refine-compact.ts`; the only network calls it makes are the summarizer LLM requests you configure).
 
 ## Settings
@@ -39,7 +40,7 @@ Every field is optional. An omitted field means **auto** — a formula derived f
 
 | Key | Type | Auto (default) | Meaning |
 |---|---|---|---|
-| `model` | `string` \| `null` | `null` — session model (stock behavior) | Summarizer as `provider/id`; also set by `/compact-model` |
+| `model` | `string` \| `null` | `null` — pi's stock compaction | Summarizer as `provider/id`, `"session"` for the session's current model, or `null` for native compaction; also set by `/compact-model` |
 | `maxPromptTokens` | int ≥ 0 | `min(32000, 0.5 × summarizer ctx)` | Hard cap on one summarizer request; a larger chunk is split preemptively |
 | `maxOutputTokens` | int ≥ 0 | `min(max(2048, 0.8 × reserveTokens), sumCtx − maxPromptTokens − ~1000)` | `maxTokens` for summarizer calls; clamped to the model's free headroom (the clamp applies to the auto value; an explicit setting is used as-is, with a warning if it exceeds the headroom) |
 | `summaryCeilingTokens` | int ≥ 0 | `min(0.35 × summarizer ctx, 0.5 × maxPromptTokens)` | When the accumulated summary exceeds this, the checkpoint itself is compressed |
@@ -73,7 +74,7 @@ Chunk sizes are estimated from character counts. The default `3` is tuned for Cy
 
 **Chunked refine** — the compacted prefix is cut into chunks at turn boundaries and merged sequentially by a cheaper summarizer into a structured checkpoint.
 **Cheap and long** — the compression runs on a small local or cloud model, so the main model doesn't pay for it and long histories fit on a modest context window.
-**Resilient** — chunks re-split on output limits, computed chunks are cached, and a failing intermediate compression degrades instead of aborting.
+**Resilient** — chunks re-split on output limits, computed chunks are cached per session/model/budgets, and a failing intermediate compression degrades instead of aborting.
 
 See [DESIGN.md](docs/DESIGN.md) for the full algorithm — budget derivation, chunking, the refine loop, resilience, and the char-based sizing rationale.
 
