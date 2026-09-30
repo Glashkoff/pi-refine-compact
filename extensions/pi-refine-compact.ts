@@ -5,7 +5,9 @@
  * Usage:
  *   /compact-model — pick the summarization model (menu like /model). The
  *   choice is persisted in $PI_CODING_AGENT_DIR/pi-refine-compact-settings.json.
- *   Empty selection = the session's default model (pi's stock behavior).
+ *   `null` (the default) keeps pi's stock compaction; `"session"` refines with the
+ *   session's current model captured at compaction time; `"provider/id"` refines
+ *   with that model.
  *
  * How it works:
  *   - Chunking: ratio = ceil(main_ctx / summarizer_ctx); the history is cut
@@ -27,7 +29,9 @@
  *     caching speeds up retries.
  *
  * Settings (all optional, all with sensible auto values):
- *   model               "provider/id" — summarizer model (also set via /compact-model)
+ *   model               "provider/id" summarizer, "session" for this session's current
+ *                       model, or null (default) for pi's stock compaction
+ *                       (also set via /compact-model)
  *   maxPromptTokens     hard cap on one summarizer request, chars-per-token based
  *   maxOutputTokens     maxTokens for summarizer calls
  *   summaryCeilingTokens  when the accumulated summary exceeds this, it is compressed
@@ -58,7 +62,7 @@ function settingsPath(): string {
 }
 
 interface CompactorSettings {
-	model: string | null; // "provider/id" | null = the session's stock model
+	model: string | null; // "provider/id" | "session" | null = pi's stock compaction
 	// All optional: omitted field = auto (formula), see DEFAULTS / auto*() below.
 	maxPromptTokens?: number;
 	maxOutputTokens?: number;
@@ -98,7 +102,7 @@ function parseSettings(raw: unknown, warn: (msg: string) => void): CompactorSett
 
 	if (typeof r.model === "string" && r.model) out.model = r.model;
 	const modelInvalid = r.model !== undefined && r.model !== null && !out.model;
-	if (modelInvalid) warn(`model: expected non-empty string — ignoring (using the session's model)`);
+	if (modelInvalid) warn(`model: expected non-empty string — ignoring (native: pi's stock compaction)`);
 
 	for (const key of ["maxPromptTokens", "maxOutputTokens", "summaryCeilingTokens"] as const) {
 		const parsed = optNonNegInt(r[key]);
@@ -127,8 +131,9 @@ function readSettings(warn: (msg: string) => void): CompactorSettings {
 function writeSettings(s: CompactorSettings): void {
 	const dir = agentDir();
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	// Persist only meaningful values: model null stays as a marker (session model),
-	// auto fields stay absent — the file contains only explicit overrides.
+	// Persist only meaningful values: model null stays as the native marker and
+	// "session" is stored verbatim (never rewritten to a concrete ref); auto fields
+	// stay absent — the file contains only explicit overrides.
 	const out: Record<string, unknown> = { model: s.model };
 	for (const key of ["maxPromptTokens", "maxOutputTokens", "summaryCeilingTokens"] as const) {
 		if (s[key] !== undefined) out[key] = s[key];
@@ -136,6 +141,12 @@ function writeSettings(s: CompactorSettings): void {
 	if (s.charsPerToken !== undefined) out.charsPerToken = s.charsPerToken;
 	writeFileSync(settingsPath(), `${JSON.stringify(out, null, 2)}\n`, "utf-8");
 }
+
+/** `settings.model` value that refines with the session's current model. */
+const SESSION_MODEL_MARKER = "session";
+
+/** API id of pi's virtual catalog entries: router-only, a request for it never reaches a provider. */
+const VIRTUAL_MODEL_API = "pi-virtual";
 
 function parseModelRef(ref: string): { provider: string; id: string } | undefined {
 	const slash = ref.indexOf("/");
@@ -186,13 +197,16 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			const current = readSettings((m) => ctx.ui.notify(`pi-refine-compact: ${m}`, "warning"));
 			const available = ctx.modelRegistry.getAvailable();
 			const sessionLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no model)";
-			const items: string[] = [`(default) session model: ${sessionLabel}`];
-			const refs: (string | null)[] = [null];
+			const marker = (ref: string | null) => (current.model === ref ? "  ← current summarizer" : "");
+			const items: string[] = [
+				`(default) native: pi's stock compaction${marker(null)}`,
+				`session model (refinement): ${sessionLabel}${marker(SESSION_MODEL_MARKER)}`,
+			];
+			const refs: (string | null)[] = [null, SESSION_MODEL_MARKER];
 			for (const m of available) {
 				const ref = `${m.provider}/${m.id}`;
 				const ctxK = m.contextWindow > 0 ? `${Math.round(m.contextWindow / 1000)}k ctx` : "ctx ?";
-				const marker = current.model === ref ? "  ← current summarizer" : "";
-				items.push(`${ref}   [${ctxK}]${marker}`);
+				items.push(`${ref}   [${ctxK}]${marker(ref)}`);
 				refs.push(ref);
 			}
 			const sel = await ctx.ui.select("Model for compaction summarization", items, {});
@@ -201,9 +215,11 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			if (chosen === undefined) return;
 			writeSettings({ ...current, model: chosen });
 			ctx.ui.notify(
-				chosen
-					? `Summarization will be performed by ${chosen}`
-					: "Summarization will use the current session model (stock pi behavior)",
+				chosen === SESSION_MODEL_MARKER
+					? `Summarization will be performed by the session model (${sessionLabel})`
+					: chosen
+						? `Summarization will be performed by ${chosen}`
+						: "Compaction stays on pi's stock behavior (native, no refinement)",
 				"info",
 			);
 		},
@@ -215,16 +231,36 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		const settings = readSettings((m) => ctx.ui.notify(`pi-refine-compact: ${m}`, "warning"));
-		if (!settings.model) return; // default — pi's stock behavior
+		const configured = settings.model;
+		if (!configured) return; // default — pi's stock behavior
 
-		const modelRef = parseModelRef(settings.model);
-		const found = modelRef ? ctx.modelRegistry.find(modelRef.provider, modelRef.id) : undefined;
+		const sessionMode = configured === SESSION_MODEL_MARKER;
+		const ref = parseModelRef(configured);
+		// Session mode captures ctx.model exactly once: the active model may change
+		// while the compaction runs, but the summarizer stays the captured one.
+		const found = sessionMode ? ctx.model : ref ? ctx.modelRegistry.find(ref.provider, ref.id) : undefined;
 		if (!found) {
-			// The model vanished from the registry — notify and fall back to stock (not silently).
-			ctx.ui.notify(`pi-refine-compact: model ${settings.model} not found — using stock compaction`, "warning");
+			// Session model unset, or the model vanished from the registry — notify and
+			// fall back to stock (never a silent switch).
+			ctx.ui.notify(
+				sessionMode
+					? "pi-refine-compact: no session model — using stock compaction"
+					: `pi-refine-compact: model ${configured} not found — using stock compaction`,
+				"warning",
+			);
+			return;
+		}
+		// A virtual model is router-only and cannot complete a request; this extension
+		// does no virtual routing, so session mode degrades to stock instead.
+		if (sessionMode && found.api === VIRTUAL_MODEL_API) {
+			ctx.ui.notify(
+				`pi-refine-compact: session model ${found.provider}/${found.id} is a virtual model (cannot complete) — using stock compaction`,
+				"warning",
+			);
 			return;
 		}
 		const model = found;
+		const resolvedRef = `${model.provider}/${model.id}`;
 
 		const { preparation, customInstructions, signal } = event;
 		const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } = preparation;
@@ -284,10 +320,17 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		// approxTokensOfChars). Default 3: tuned for Cyrillic prose + JSON wrappers.
 		const charsPerToken = settings.charsPerToken ?? DEFAULTS.charsPerToken;
 
+		// Cache scope: this run's identity — session + resolved summarizer + derived
+		// budgets. Cached chunks are reused only inside the same scope, so a different
+		// session, model, or budget recomputes instead of reusing stale text.
+		const cacheScope = fnv1a(
+			`${ctx.sessionManager.getSessionId()}|${resolvedRef}|${maxPromptTokens}|${maxTokens}|${accCeiling}|${charsPerToken}`,
+		);
+
 		const chunks = chunkByTurns(allMessages, ratio, sumCtx, safetyBudget, previousSummary, charsPerToken);
 		const totalChars = chunks.reduce((acc, c) => acc + approxChars(c), 0);
 		ctx.ui.notify(
-			`pi-refine-compact: ${chunks.length} chunk(s), ~${Math.round(totalChars / charsPerToken / 1000)}k tok., model ${settings.model}`,
+			`pi-refine-compact: ${chunks.length} chunk(s), ~${Math.round(totalChars / charsPerToken / 1000)}k tok., model ${resolvedRef}`,
 			"info",
 		);
 
@@ -341,7 +384,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		async function refineChunk(chunk: AgentMessage[], rawAcc: string | undefined, depth: number): Promise<string> {
 			const accText = rawAcc ?? "";
 			const convText = serializeConversation(convertToLlm(chunk));
-			const key = `R|${fnv1a(convText)}|${fnv1a(accText)}|${fnv1a(customInstructions ?? "")}`;
+			const key = `R|${cacheScope}|${fnv1a(convText)}|${fnv1a(accText)}|${fnv1a(customInstructions ?? "")}`;
 			const cached = chunkCache.get(key);
 			if (cached !== undefined) {
 				cacheHits++;
@@ -391,7 +434,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			if (!accText) return accText;
 			const accTokens = approxTokensOfChars(accText.length, charsPerToken);
 			if (accTokens <= accCeiling) return accText;
-			const key = `C|${fnv1a(accText)}`;
+			const key = `C|${cacheScope}|${fnv1a(accText)}`;
 			const cached = chunkCache.get(key);
 			if (cached !== undefined) {
 				cacheHits++;
@@ -448,7 +491,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				details: {
 					readFiles,
 					modifiedFiles,
-					refineCompactModel: settings.model,
+					refineCompactModel: resolvedRef,
 					chunks: chunks.length,
 					retrySplits,
 					cacheHits,
