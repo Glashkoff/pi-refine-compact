@@ -18,10 +18,16 @@
  *     Matches the paper's update_memory recursion: new memory = f(old memory,
  *     next dialogue context), started from a first-chunk memorization call.
  *   - Resilience: a length-stop on a chunk re-splits that chunk at turn
- *     boundaries (up to 2 levels); transient errors retry the call once.
+ *     boundaries (up to 2 levels); when the reply budget itself is exhausted
+ *     (a large running summary forces an over-long update reply), the running
+ *     summary is compressed and the chunk retried once. Transient errors and
+ *     provider-side ghost aborts retry with pi-style exponential backoff
+ *     (up to 3 attempts, base 1s, cap 60s); a real signal abort
+ *     still cancels the compaction.
  *   - Summary ceiling: when the accumulated summary exceeds its ceiling
- *     (~35% of the summarizer's context), it is compacted via an intermediate
- *     compression call so chunk + summary always fit into the context window.
+ *     (~35% of the summarizer's context, never above the reply budget), it is
+ *     compacted via an intermediate compression call so chunk + summary
+ *     always fit into the context window.
  *   - Summary language is always English (small models do better with EN,
  *     fewer tokens); a checkpoint-time header is added; in-memory chunk
  *     caching speeds up retries.
@@ -77,6 +83,12 @@ const DEFAULTS = {
 	summaryCeilingFraction: 0.35,
 	/** Auto chars-per-token (see approxTokensOfChars). */
 	charsPerToken: 3,
+	/** Retries per summarizer call — pi's default retry policy, mirrored here
+	 * because modelRegistry.complete bypasses the session-level retry wrapper
+	 * (baseDelayMs 1000, exponential backoff, capped at retryMaxDelayMs). */
+	retryAttempts: 3,
+	retryBaseDelayMs: 1000,
+	retryMaxDelayMs: 60000,
 };
 
 /** Non-negative safe integer, or undefined. */
@@ -175,6 +187,9 @@ class LengthCapError extends Error {
 	}
 }
 
+/** A deterministic provider limit — retrying only burns attempts (pi's
+ * NON_RETRYABLE provider-limit family: quota/billing/usage limits). */
+const NON_RETRYABLE_ERROR_PATTERN = /quota|insufficient|out of budget|usage limit|billing|subscription/i;
 // ============================================================================
 // /compact-model command — choose the summarization model
 // ============================================================================
@@ -247,14 +262,17 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		const safetyBudget = Math.max(8000, Math.min(50000, Math.floor((sumCtx - reserveTokens) * 0.75)));
 
 		// --- Configurable budgets (auto formulas when not set) -----------------
-		// Hard cap on a single summarizer request; a chunk whose serialized prompt
-		// exceeds it is split preemptively (before the provider replies with
-		// exceed_context_size_error). Auto: never above 32k and never above half
-		// the summarizer's context, because char-based estimates undershoot real
-		// tokenizer counts.
+		// Auto: 32k for unknown/small windows (legacy hardcoded cap); for large
+		// KNOWN windows the cap grows above 32k so it does not fight the chunk
+		// budget — a 50k-token chunk in a 1M context must not be forced to split
+		// into two ~25k sequential GPU calls (slow, and with reasoning models
+		// each call pays extra thinking latency). Never above half the window:
+		// char-based estimates undershoot real tokenizer counts.
 		const maxPromptTokens = settings.maxPromptTokens ?? Math.min(
-			DEFAULTS.maxPromptTokens,
 			Math.floor(sumCtx * 0.5),
+			DEFAULTS.maxPromptTokens < Math.floor(sumCtx * 0.5)
+				? Math.max(DEFAULTS.maxPromptTokens, safetyBudget + 8192)
+				: DEFAULTS.maxPromptTokens,
 		);
 		// maxTokens for summarizer calls. reserveTokens is calibrated for the MAIN
 		// model; for a small summarizer the API can reject too-large limits, hence
@@ -274,26 +292,38 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			);
 		}
 		// C2: when the accumulated summary outgrows this ceiling, the checkpoint
-		// itself is compressed. Auto: 35% of the summarizer's context (bounded by
-		// the prompt cap so chunk + summary always fit).
+		// itself is compressed. Auto: 35% of the summarizer's context, bounded by
+		// the prompt cap AND by the reply budget (maxTokens): an update reply must
+		// PRESERVE the accumulated summary, so a reply longer than maxTokens would
+		// deterministically hit stop:"length" — it cannot be fixed by splitting the
+		// chunk (the summary does not shrink). The reply fraction (60% of
+		// maxTokens) leaves room for the new chunk's additions inside the same
+		// reply; THIS FRACTION IS SHARED with compressAccToBudget below — a
+		// deliberate single knob, do not diverge. E.g. a 1M-ctx summarizer
+		// previously yielded accCeiling 16000 > maxTokens 13107 — guaranteed caps.
+		const accReplyFraction = 0.6;
 		const accCeiling = settings.summaryCeilingTokens ?? Math.min(
 			Math.floor(sumCtx * DEFAULTS.summaryCeilingFraction),
 			Math.floor(maxPromptTokens * 0.5),
+			Math.floor(maxTokens * accReplyFraction),
 		);
 		// Chars-per-token estimate for this conversation's language (see
 		// approxTokensOfChars). Default 3: tuned for Cyrillic prose + JSON wrappers.
 		const charsPerToken = settings.charsPerToken ?? DEFAULTS.charsPerToken;
 
-		const chunks = chunkByTurns(allMessages, ratio, sumCtx, safetyBudget, previousSummary, charsPerToken);
+		// maxPromptTokens resolved above (budgets block); passed so chunking
+		// directly respects the prompt cap without preemptive splits.
+		const chunks = chunkByTurns(allMessages, ratio, sumCtx, safetyBudget, previousSummary, charsPerToken, maxPromptTokens);
 		const totalChars = chunks.reduce((acc, c) => acc + approxChars(c), 0);
 		ctx.ui.notify(
 			`pi-refine-compact: ${chunks.length} chunk(s), ~${Math.round(totalChars / charsPerToken / 1000)}k tok., model ${settings.model}`,
 			"info",
 		);
 
-				let acc = previousSummary ?? "";
+		let acc = previousSummary ?? "";
 		const usageParts: UsageLike[] = [];
 		let retrySplits = 0;
+		let shrinkCount = 0;
 		let cacheHits = 0;
 
 		const extractText = (response: unknown): string => {
@@ -305,10 +335,30 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				.trim();
 		};
 
-		/** One LLM call: transient error/empty → 1 retry; length → LengthCapError. */
+		/** Abort-aware backoff sleep (pi-style: exponential, capped at 60 s). */
+		const sleepMs = (ms: number) =>
+			new Promise<void>((resolve) => {
+				const t = setTimeout(() => {
+					signal?.removeEventListener("abort", onAbort);
+					resolve();
+				}, ms);
+				const onAbort = () => {
+					clearTimeout(t);
+					resolve();
+				};
+				signal?.addEventListener("abort", onAbort, { once: true });
+			});
+
+		/** One LLM call with pi-style resilience: up to RETRY_ATTEMPTS tries with
+		 * exponential backoff for transient failures (`stop:"error"`, empty reply,
+		 * provider ghost aborts); non-retryable errors (quota/billing) and
+		 * `stop:"length"` (LengthCapError) fail immediately; a real signal abort
+		 * cancels the compaction. Mirrors pi's default retry policy
+		 * (maxRetries 3, baseDelayMs 1000, exponential, cap 60s), which the
+		 * extension bypasses by calling modelRegistry.complete directly. */
 		async function callSummarizer(promptText: string, label: string): Promise<string> {
 			let lastErr = "unknown";
-			for (let attempt = 0; attempt < 2; attempt++) {
+			for (let attempt = 1; attempt <= DEFAULTS.retryAttempts; attempt++) {
 				if (signal?.aborted) throw new Error("Compaction cancelled");
 				const response = await ctx.modelRegistry.complete(
 					model,
@@ -319,26 +369,45 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 					{ maxTokens, signal, cacheRetention: "none", sessionId: uuidv7() },
 				);
 				const stop = (response as { stopReason?: string }).stopReason;
-				if (stop === "aborted") throw new Error("Compaction cancelled");
-				if (stop === "error") {
+				// stop:"aborted" normally means real cancellation (signal aborted) — fatal.
+				// Some providers also surface it when the connection drops mid-stream with
+				// the signal still live; treat that as a transient error rather than
+				// killing the whole compaction run.
+				if (stop === "aborted") {
+					if (signal?.aborted) throw new Error("Compaction cancelled");
+					lastErr = "reply aborted by provider";
+				} else if (stop === "error") {
 					lastErr = (response as { errorMessage?: string }).errorMessage ?? "LLM error";
-					continue;
-				}
-				if (stop === "length") throw new LengthCapError(label);
-				const text = extractText(response);
-				if (!text) {
+					// A deterministic provider limit (quota/billing) will not heal on
+					// retry — fail fast instead of burning the remaining attempts.
+					if (NON_RETRYABLE_ERROR_PATTERN.test(lastErr)) {
+						throw new Error(`pi-refine-compact: ${label}: ${lastErr}`);
+					}
+				} else if (stop === "length") {
+					throw new LengthCapError(label);
+				} else {
+					const text = extractText(response);
+					if (text) {
+						const u = (response as { usage?: UsageLike }).usage;
+						if (u) usageParts.push(u);
+						return text;
+					}
 					lastErr = "empty summary";
-					continue;
 				}
-				const u = (response as { usage?: UsageLike }).usage;
-				if (u) usageParts.push(u);
-				return text;
+				// Transient failure: more attempts left → notify and back off.
+				if (attempt < DEFAULTS.retryAttempts) {
+					const delayMs = Math.min(DEFAULTS.retryMaxDelayMs, DEFAULTS.retryBaseDelayMs * 2 ** (attempt - 1));
+					ctx.ui.notify(`pi-refine-compact: ${label} failed (${lastErr}) — retry ${attempt + 1}/${DEFAULTS.retryAttempts} in ${delayMs / 1000}s`, "warning");
+		await sleepMs(delayMs);
+					if (signal?.aborted) throw new Error("Compaction cancelled");
+				}
 			}
 			throw new Error(`pi-refine-compact: ${label}: ${lastErr}`);
+		throw new Error(`pi-refine-compact: ${label}: ${lastErr}`);
 		}
 
-		/** Refine one chunk; on length-cap — split the chunk at turn boundaries (C1). */
-		async function refineChunk(chunk: AgentMessage[], rawAcc: string | undefined, depth: number): Promise<string> {
+		/** Refine one chunk; on length-cap — split shallow, or shrink the running summary when deep (C1). */
+		async function refineChunk(chunk: AgentMessage[], rawAcc: string | undefined, depth: number, retriedShrink = false): Promise<string> {
 			const accText = rawAcc ?? "";
 			const convText = serializeConversation(convertToLlm(chunk));
 			const key = `R|${fnv1a(convText)}|${fnv1a(accText)}|${fnv1a(customInstructions ?? "")}`;
@@ -371,15 +440,30 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				cacheSet(key, text);
 				return text;
 			} catch (e) {
-				if (e instanceof LengthCapError && depth < 2) {
-					const halves = splitInto2(chunk, charsPerToken);
-					if (halves) {
-						retrySplits++;
-						ctx.ui.notify(`pi-refine-compact: chunk hit the length cap — split at turn boundaries (level ${depth + 1})`, "info");
-						let local = accText;
-						for (const half of halves) local = await refineChunk(half, local, depth + 1);
-						cacheSet(key, local);
-						return local;
+				if (e instanceof LengthCapError) {
+					// Deep level (depth ≥ 2): the split depth is exhausted, and splitting
+					// cannot help anyway when the REPLY (acc + new material) outgrew
+					// maxTokens — shrink the accumulated summary and retry the same
+					// chunk once with a smaller running summary.
+					if (depth >= 2 && accText && !retriedShrink) {
+						const shrunken = await compressAccToBudget(accText);
+						if (shrunken.length < accText.length) {
+							shrinkCount++;
+							ctx.ui.notify(`pi-refine-compact: reply hit maxTokens with a large running summary — compressed it and retrying the chunk`, "info");
+							return refineChunk(chunk, shrunken, depth, true);
+						}
+					}
+					// Shallow level: split the chunk at turn boundaries and re-summarize.
+					if (depth < 2) {
+						const halves = splitInto2(chunk, charsPerToken);
+						if (halves) {
+							retrySplits++;
+							ctx.ui.notify(`pi-refine-compact: chunk hit the length cap — split at turn boundaries (level ${depth + 1})`, "info");
+							let local = accText;
+							for (const half of halves) local = await refineChunk(half, local, depth + 1);
+							cacheSet(key, local);
+							return local;
+						}
 					}
 				}
 				throw e;
@@ -410,6 +494,31 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				// like a length cap would otherwise repeat on every retry).
 				ctx.ui.notify(
 					`pi-refine-compact: checkpoint compression failed (${e instanceof Error ? e.message : String(e)}) — continuing with the uncompressed summary`,
+					"warning",
+				);
+				return accText;
+			}
+		}
+
+		/** Shrink the running summary so an update reply fits into maxTokens:
+		 * target = 60% of maxTokens. Non-fatal — returns the input unchanged on
+		 * failure so the caller can decide. */
+		async function compressAccToBudget(accText: string): Promise<string> {
+			if (!accText) return accText;
+			const accTokens = approxTokensOfChars(accText.length, charsPerToken);
+			const target = Math.floor(maxTokens * accReplyFraction);
+			if (accTokens <= target) return accText;
+			const key = `S|${fnv1a(accText)}`;
+			const cached = chunkCache.get(key);
+			if (cached !== undefined) return cached;
+			const promptText = `<checkpoint>\n${accText}\n</checkpoint>\n\n${COMPRESS_PROMPT.replace("__TARGET__", String(target))}`;
+			try {
+				const text = await callSummarizer(promptText, "checkpoint-shrink");
+				cacheSet(key, text);
+				return text;
+			} catch (e) {
+				ctx.ui.notify(
+					`pi-refine-compact: summary shrink failed (${e instanceof Error ? e.message : String(e)})`,
 					"warning",
 				);
 				return accText;
@@ -451,6 +560,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 					refineCompactModel: settings.model,
 					chunks: chunks.length,
 					retrySplits,
+					shrinkCount,
 					cacheHits,
 					budgets: { maxPromptTokens, maxOutputTokens: maxTokens, summaryCeilingTokens: accCeiling, charsPerToken },
 				},
@@ -481,9 +591,14 @@ function approxChars(messages: AgentMessage[]): number {
 		} else if (Array.isArray(content)) {
 			for (const block of content) {
 				if (block && typeof block === "object" && "text" in block) chars += String((block as { text?: string }).text ?? "").length;
+				// Non-text blocks (tool calls with their arguments, thinking, etc.)
+				// are serialized into the prompt verbatim — count their whole JSON
+				// size. The old +200-char assistant heuristic missed tool-call
+				// arguments (commands, code, file contents), which made estimates
+				// undershoot by several times and fired bogus preemptive splits.
+				else if (block && typeof block === "object") chars += JSON.stringify(block).length;
 			}
 		}
-		if (m.role === "assistant") chars += 200; // thinking/tool calls — heuristic
 		if (m.role === "toolResult") chars += 500; // serialize truncates to ~2000 chars
 	}
 	return chars;
@@ -582,14 +697,21 @@ function chunkByTurns(
 	safetyBudget: number,
 	previousSummary: string | undefined,
 	charsPerToken: number,
+	maxPromptTokens: number,
 ): AgentMessage[][] {
 	const turns = splitTurns(messages);
 	if (turns.length === 0) return [messages];
 	const prevTokens = previousSummary ? approxTokensOfChars(previousSummary.length, charsPerToken) : 0;
 
-	// Serialization budget per chunk: sumCtx − instructions − prev-summary, with a safety cap.
+	// Serialization budget per chunk: sumCtx − instructions − prev-summary, with
+	// a safety cap, and never above the prompt cap minus its own payload — so a
+	// well-formed chunk does not trip an immediate preemptive split.
 	const instrReserve = 2500 + prevTokens;
-	const chunkBudget = Math.max(4000, Math.min(safetyBudget, Math.floor((sumCtx - instrReserve) * 0.75)));
+	const chunkBudget = Math.max(4000, Math.min(
+		safetyBudget,
+		Math.floor((sumCtx - instrReserve) * 0.75),
+		Math.max(4000, maxPromptTokens - instrReserve - 1500),
+	));
 
 	// Estimate turn sizes.
 	const turnSizes = turns.map((t) => approxTokensOfChars(approxChars(t), charsPerToken));

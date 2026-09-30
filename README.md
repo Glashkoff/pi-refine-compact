@@ -86,7 +86,7 @@ This approach trades off latency, precision, and token efficiency for cheaper ma
 - **Cheaper main-model usage** — the compression step runs on the chosen summarizer (often a small, cheap or local model) instead of the main model, so you don't burn expensive context on a pure housekeeping task.
 - **Very long histories on a small window** — chunking plus the recursive
 - **Structured, downstream-friendly checkpoint** — the fixed format is easy for another LLM to consume and preserves file paths, commands, and decisions verbatim.
-- **Resilient by design** — preemptive and length-cap splits, one transient retry, in-memory reuse of computed chunks, and degraded mode for checkpoint compression mean compaction almost never aborts outright.
+- **Resilient by design** — preemptive and length-cap splits, pi-style retries (up to 3 with exponential backoff) on transient failures, in-memory reuse of computed chunks, and degraded mode for checkpoint compression mean compaction almost never aborts outright.
 - **Multi-stage aware** — it seeds from `previousSummary`, so repeated compactions build on the prior checkpoint instead of starting over.
 
 **Weaknesses:**
