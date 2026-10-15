@@ -45,6 +45,7 @@ Every field is optional. An omitted field means **auto** — a formula derived f
 | `maxOutputTokens` | int ≥ 0 | `min(max(2048, 0.8 × reserveTokens), sumCtx − maxPromptTokens − ~1000)` | `maxTokens` for summarizer calls; clamped to the model's free headroom (the clamp applies to the auto value; an explicit setting is used as-is, with a warning if it exceeds the headroom) |
 | `summaryCeilingTokens` | int ≥ 0 | `min(0.35 × summarizer ctx, 0.5 × maxPromptTokens)` | When the accumulated summary exceeds this, the checkpoint itself is compressed |
 | `charsPerToken` | number ≥ 1 | `3` | Chars-per-token estimate for your typical conversation language (see below) |
+| `reasoning` | thinking level \| `"off"` \| `null` | `"low"` | Thinking effort for summarizer calls (shares the reply cap with the visible summary). Resolved to the nearest level the model supports (warns on change); `"off"`/`null` mean no thinking is requested. |
 
 The auto prompt cap is `min(32000, 0.5 × summarizer ctx)` — e.g. 16000 tokens on the 32k fallback window, 32000 for any summarizer with ≥ 64k context. It scales down for smaller summarizers so the cap always leaves room for instructions, the previous summary, and the reply. If you want large summarizers to receive larger chunks, set `maxPromptTokens` explicitly.
 

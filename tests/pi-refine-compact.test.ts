@@ -32,7 +32,27 @@ mock.module("@earendil-works/pi-tui", () => ({
 	fuzzyFilter: () => [],
 	getKeybindings: () => ({}),
 }));
-mock.module("@earendil-works/pi-ai", () => ({ uuidv7: () => `test-uuid-${++uuidCounter}` }));
+mock.module("@earendil-works/pi-ai", () => ({
+	uuidv7: () => `test-uuid-${++uuidCounter}`,
+	// Mirrors pi-ai's clampThinkingLevel (same file: models.ts).
+	clampThinkingLevel: (model: Any, level: string) => {
+		const order = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+		const supported = !model.reasoning
+			? ["off"]
+			: order.filter((l) => {
+					const mapped = model.thinkingLevelMap?.[l];
+					if (mapped === null) return false;
+					if (l === "xhigh" || l === "max") return mapped !== undefined;
+					return true;
+				});
+		if (supported.includes(level)) return level;
+		const i = order.indexOf(level);
+		if (i === -1) return supported[0] ?? "off";
+		for (let j = i; j < order.length; j++) if (supported.includes(order[j])) return order[j];
+		for (let j = i - 1; j >= 0; j--) if (supported.includes(order[j])) return order[j];
+		return supported[0] ?? "off";
+	},
+}));
 
 type Any = any;
 
@@ -58,8 +78,8 @@ extension({
 const command = commands["compact-model"];
 const compactHandler = hooks["session_before_compact"];
 
-function makeModel(provider: string, id: string, contextWindow = 8000, api = "test-api") {
-	return { provider, id, api, contextWindow, maxTokens: 4096 };
+function makeModel(provider: string, id: string, contextWindow = 8000, api = "test-api", reasoning = true) {
+	return { provider, id, api, contextWindow, maxTokens: 4096, reasoning };
 }
 
 function okResponse(text = "## Goal\nRefined checkpoint") {
@@ -74,7 +94,7 @@ interface CtxOptions {
 
 function makeCtx(opts: CtxOptions) {
 	const notifications: { message: string; level: string }[] = [];
-	const completeCalls: { modelRef: string }[] = [];
+	const completeCalls: { modelRef: string; options?: Any }[] = [];
 	const ctx: Any = {
 		ui: {
 			notify: (message: string, level: string) => {
@@ -86,8 +106,8 @@ function makeCtx(opts: CtxOptions) {
 			getAvailable: () => opts.available ?? [],
 			find: (p: string, id: string) =>
 				(opts.available ?? []).find((m: Any) => m.provider === p && m.id === id),
-			complete: async (model: Any) => {
-				completeCalls.push({ modelRef: `${model.provider}/${model.id}` });
+			complete: async (model: Any, _context: Any, options: Any) => {
+				completeCalls.push({ modelRef: `${model.provider}/${model.id}`, options });
 				return okResponse();
 			},
 		},
@@ -268,4 +288,73 @@ test("the chunk cache is isolated by session, resolved model, and budgets", asyn
 	const otherBudget = makeCtx({ sessionId: "cache-same", model });
 	await compactHandler(makeEvent(messages()), otherBudget.ctx);
 	expect(otherBudget.completeCalls.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Thinking effort: explicit, validated, budgeted
+// ---------------------------------------------------------------------------
+
+test("thinking effort is explicit, uniform per model metadata; unsupported warns", async () => {
+	// Muse-spark shape: thinking model whose map excludes "off" (null).
+	const model = { ...makeModel("prov", "think-model", 16000), thinkingLevelMap: { off: null } };
+
+	writeRawSettings({ model: "session" });
+	const absent = makeCtx({ sessionId: "think-absent", model });
+	await compactHandler(makeEvent(turns(4, "absent")), absent.ctx);
+	expect(absent.completeCalls.length).toBeGreaterThan(0);
+	expect(absent.completeCalls.every((c: Any) => c.options?.reasoning === "low")).toBe(true);
+	expect(absent.notifications.some((n) => n.level === "warning" && n.message.includes("reasoning"))).toBe(false);
+
+	writeRawSettings({ model: "session", reasoning: "Medium" });
+	const medium = makeCtx({ sessionId: "think-medium", model });
+	await compactHandler(makeEvent(turns(4, "medium")), medium.ctx);
+	expect(medium.completeCalls.every((c: Any) => c.options?.reasoning === "medium")).toBe(true);
+
+	// "off" is unsupported here: nearest supported is "minimal".
+	writeRawSettings({ model: "session", reasoning: "off" });
+	const off = makeCtx({ sessionId: "think-off", model });
+	await compactHandler(makeEvent(turns(4, "off")), off.ctx);
+	expect(off.notifications.some((n) => n.level === "warning" && n.message.includes('using "minimal"'))).toBe(true);
+	expect(off.completeCalls.every((c: Any) => c.options?.reasoning === "minimal")).toBe(true);
+
+	// Beyond this model's range: nearest supported downward is "high".
+	writeRawSettings({ model: "session", reasoning: "xhigh" });
+	const xhigh = makeCtx({ sessionId: "think-xhigh", model });
+	await compactHandler(makeEvent(turns(4, "xhigh")), xhigh.ctx);
+	expect(xhigh.completeCalls.every((c: Any) => c.options?.reasoning === "high")).toBe(true);
+
+	// Non-thinking model: nearest supported is "off", so the option is omitted.
+	const plain = { ...makeModel("prov", "plain-model", 16000), reasoning: false };
+	writeRawSettings({ model: "session" });
+	const plainCtx = makeCtx({ sessionId: "think-plain", model: plain });
+	await compactHandler(makeEvent(turns(4, "plain")), plainCtx.ctx);
+	expect(plainCtx.completeCalls.every((c: Any) => !("reasoning" in (c.options ?? {})))).toBe(true);
+
+	writeRawSettings({ model: "session", reasoning: "ultra" });
+	const junk = makeCtx({ sessionId: "think-junk", model });
+	await compactHandler(makeEvent(turns(4, "junk")), junk.ctx);
+	expect(junk.notifications.some((n) => n.level === "warning" && n.message.includes("reasoning"))).toBe(true);
+	expect(junk.completeCalls.every((c: Any) => c.options?.reasoning === "low")).toBe(true);
+});
+
+test("requested maxTokens covers the visible budget plus thinking headroom", async () => {
+	// Small model: 0.8 x reserve(1024) = 819 -> floor 2048 visible;
+	// hard ceiling max(512, 8000 - 4000 - 1000) = 3000 wins over 2048 + 8192.
+	const small = makeModel("prov", "small-model", 8000);
+	small.maxTokens = 4096;
+	writeRawSettings({ model: "session" });
+	const smallCtx = makeCtx({ sessionId: "think-cap-small", model: small });
+	await compactHandler(makeEvent(turns(4, "capsmall")), smallCtx.ctx);
+	expect(smallCtx.completeCalls.length).toBeGreaterThan(0);
+	expect(smallCtx.completeCalls.every((c: Any) => c.options?.maxTokens === 3000)).toBe(true);
+
+	// Large model: visible 0.8 x 16384 = 13107 plus headroom 8192, under headroom and model caps.
+	const big = { provider: "prov", id: "big-model", api: "test-api", contextWindow: 1048576, maxTokens: 131072 };
+	const bigEvent = makeEvent(turns(4, "capbig"));
+	bigEvent.preparation.settings = { reserveTokens: 16384 };
+	writeRawSettings({ model: "session" });
+	const bigCtx = makeCtx({ sessionId: "think-cap-big", model: big });
+	await compactHandler(bigEvent, bigCtx.ctx);
+	expect(bigCtx.completeCalls.length).toBeGreaterThan(0);
+	expect(bigCtx.completeCalls.every((c: Any) => c.options?.maxTokens === 13107 + 8192)).toBe(true);
 });

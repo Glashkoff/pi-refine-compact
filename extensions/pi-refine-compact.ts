@@ -47,7 +47,7 @@
  */
 
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
-import { uuidv7 } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, uuidv7, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { Container, fuzzyFilter, getKeybindings, Input, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -74,6 +74,7 @@ interface CompactorSettings {
 	maxOutputTokens?: number;
 	summaryCeilingTokens?: number;
 	charsPerToken?: number;
+	reasoning?: string | null;
 }
 
 /** Hard caps of the auto formulas: an explicitly set value may exceed these,
@@ -87,6 +88,8 @@ const DEFAULTS = {
 	summaryCeilingFraction: 0.35,
 	/** Auto chars-per-token (see approxTokensOfChars). */
 	charsPerToken: 3,
+	/** Thinking headroom added to the auto reply cap. */
+	thinkingHeadroom: 8192,
 	/** Retries per summarizer call — pi's default retry policy, mirrored here
 	 * because modelRegistry.complete bypasses the session-level retry wrapper
 	 * (baseDelayMs 1000, exponential backoff, capped at retryMaxDelayMs). */
@@ -107,6 +110,10 @@ function optNonNegInt(v: unknown): number | undefined {
  * (pi principle: invalid settings are an error on read, not a silent rollback)
  * and fall back to their auto formula.
  */
+// Local copy: pi-ai declares these in providers/model-schema but does not
+// re-export them from the package root; a deep dist import would be worse.
+const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 function parseSettings(raw: unknown, warn: (msg: string) => void): CompactorSettings {
 	const out: CompactorSettings = { model: null };
 	if (typeof raw !== "object" || raw === null) return out;
@@ -121,6 +128,16 @@ function parseSettings(raw: unknown, warn: (msg: string) => void): CompactorSett
 		if (r[key] !== undefined && parsed === undefined) warn(`${key}: expected a non-negative integer — ignoring (auto)`);
 		if (parsed !== undefined) out[key] = parsed;
 	}
+	const reasoning = r.reasoning;
+	if (reasoning === null) out.reasoning = null;
+	else if (typeof reasoning === "string") {
+		const level = reasoning.trim().toLowerCase();
+		// Never forward raw input: unclamped providers map unknown levels
+		// (including "off") to maximum effort.
+		if ((THINKING_LEVELS as readonly string[]).includes(level) || level === "off") out.reasoning = level;
+		else warn(`reasoning: expected minimal/low/medium/high/xhigh/max/off — ignoring (auto: low)`);
+	}
+	else if (reasoning !== undefined) warn(`reasoning: expected minimal/low/medium/high/xhigh/max/off — ignoring (auto: low)`);
 	const cpt = r.charsPerToken;
 	if (cpt !== undefined) {
 		if (typeof cpt === "number" && Number.isFinite(cpt) && cpt >= 1) out.charsPerToken = cpt;
@@ -151,6 +168,7 @@ function writeSettings(s: CompactorSettings): void {
 		if (s[key] !== undefined) out[key] = s[key];
 	}
 	if (s.charsPerToken !== undefined) out.charsPerToken = s.charsPerToken;
+	if (s.reasoning !== undefined) out.reasoning = s.reasoning;
 	writeFileSync(settingsPath(), `${JSON.stringify(out, null, 2)}\n`, "utf-8");
 }
 
@@ -450,12 +468,25 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		// the explicit setting. Auto: 80% of reserveTokens with a 2048 floor —
 		// clamped to the headroom the chunk leaves in the summarizer's window
 		// (hard ceiling wins when even the floor does not fit).
+		const requested = (settings.reasoning === null ? "off" : (settings.reasoning ?? "low")) as ModelThinkingLevel;
+		const clamped = clampThinkingLevel(model, requested);
+		if (clamped !== requested) {
+			ctx.ui.notify(
+				`pi-refine-compact: reasoning "${requested}" is not supported by ${resolvedRef} — using "${clamped}"`,
+				"warning",
+			);
+		}
+		const reasoning = clamped === "off" ? undefined : clamped;
+		const modelMaxTokens = model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY;
 		const maxTokensHardCeiling = Math.max(512, sumCtx - maxPromptTokens - 1000);
+		const visibleTokens =
+			settings.maxOutputTokens ??
+			(maxTokensHardCeiling < DEFAULTS.maxOutputTokensFloor
+				? maxTokensHardCeiling
+				: Math.min(maxTokensHardCeiling, Math.max(DEFAULTS.maxOutputTokensFloor, Math.floor(reserveTokens * 0.8))));
 		const maxTokens =
-			(settings.maxOutputTokens ??
-				(maxTokensHardCeiling < DEFAULTS.maxOutputTokensFloor
-					? maxTokensHardCeiling
-					: Math.min(maxTokensHardCeiling, Math.max(DEFAULTS.maxOutputTokensFloor, Math.floor(reserveTokens * 0.8)))));
+			settings.maxOutputTokens ??
+			Math.min(maxTokensHardCeiling, modelMaxTokens, visibleTokens + DEFAULTS.thinkingHeadroom);
 		if (settings.maxOutputTokens !== undefined && settings.maxOutputTokens > maxTokensHardCeiling) {
 			ctx.ui.notify(
 				`pi-refine-compact: maxOutputTokens (${settings.maxOutputTokens}) exceeds the model's free headroom (~${maxTokensHardCeiling}) — the provider may reject the request`,
@@ -490,8 +521,9 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		const cacheScope = [
 			ctx.sessionManager.getSessionId(),
 			resolvedRef,
-			maxPromptTokens,
-			maxTokens,
+		maxPromptTokens,
+		maxTokens,
+		reasoning ?? "provider-default",
 			accCeiling,
 			charsPerToken,
 		].join("|");
@@ -567,7 +599,16 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 						systemPrompt: SYSTEM_PROMPT,
 						messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
 					},
-					{ maxTokens, signal, cacheRetention: "none", sessionId: uuidv7() },
+					{
+						maxTokens,
+						signal,
+						cacheRetention: "none",
+						sessionId: uuidv7(),
+						// Explicit effort: thinking shares maxTokens with the visible
+						// summary on every provider, so an uncontrolled default can
+						// starve the answer. Omitted for non-thinking models.
+							...(reasoning !== undefined ? { reasoning } : {}),
+					},
 				);
 				const stop = (response as { stopReason?: string }).stopReason;
 				// stop:"aborted" normally means real cancellation (signal aborted) — fatal.
@@ -585,6 +626,8 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 						throw new Error(`pi-refine-compact: ${label}: ${lastErr}`);
 					}
 				} else if (stop === "length") {
+					const u = (response as { usage?: UsageLike }).usage;
+					if (u) usageParts.push(u);
 					throw new LengthCapError(label);
 				} else {
 					const text = extractText(response);
